@@ -49,6 +49,19 @@ pip install -r requirements.txt
 
 ### 3. Configure Environment Variables
 
+#### Create a Spotify Developer App (required)
+
+To obtain the required keys, you must create a Spotify application:
+
+- Go to the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)
+- Log in and click “Create app”. Give it a name and short description.
+- In your app settings, add a Redirect URI and Save: `http://127.0.0.1:8888/callback`
+	- This must exactly match what you pass via `--redirect-uri` or put in `SPOTIFY_REDIRECT_URI`.
+- Copy the Client ID and reveal/copy the Client Secret.
+- Paste these values into your `.env` (or provide via CLI flags at runtime).
+
+For personal use, no app review is required. On first run, a browser window will open to let you authorize the requested scopes.
+
 Copy `.env.template` to `.env` and fill values according to your setup. You’ll need a Spotify Developer app with the proper redirect URI.
 
 Required:
@@ -66,7 +79,7 @@ Optional (tuning):
 - `SHAZAM_TIMEOUT_SECONDS`, `SHAZAM_MAX_RETRIES`, `SHAZAM_BACKOFF_BASE`
 - `LOG_FILE` – Where to write the failures log (default: `failed_tracks.log`)
 
-Scopes: The app needs `user-library-read` and `user-library-modify` configured. During the first run you’ll complete the OAuth flow in the browser.
+Scopes: During the first run you’ll complete the OAuth flow in the browser and approve `user-library-read` and `user-library-modify`. You don’t configure scopes in the dashboard; they’re requested by the app at login time.
 
 ### 4. Usage
 
