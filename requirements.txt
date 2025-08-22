@@ -1,0 +1,5 @@
+pandas
+spotipy
+python-dotenv
+rich
+shazamio
