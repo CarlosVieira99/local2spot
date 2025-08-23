@@ -2,15 +2,12 @@
 
 Recognize local `.mp3` files with Shazam and add matches to your Spotify Liked Songs. Includes both a simple sequential script and a fast async version with bounded concurrency, a live TUI, retries/backoff, and failure logging.
 
-Note: By default, the scripts do not perform the final “add to Liked Songs” call; they only check if a track is already liked and report “added” as a dry run. See the note in Usage to enable actual adding.
-
 ## Features and File Overview
 
 - Shazam recognition: identifies local `.mp3` tracks using the `shazamio` async API
 	- `main_sync.py` (sequential; async only to call Shazam)
 	- `main_async.py` (concurrent; bounded workers for faster throughput)
 - Spotify integration: searches Spotify and checks if tracks are already in Liked Songs
-- Dry-run by default: reports “added” without modifying your library; toggle a single line to enable real adds
 - Live terminal UI: progress, ETA, and stats rendered with `rich`
 - Resilient: timeouts, retries, and exponential backoff for Shazam and Spotify calls
 - Configurable: `.env` support via `python-dotenv`; CLI flags override env vars
@@ -78,6 +75,7 @@ Optional (tuning):
 - `SPOTIFY_MAX_CALL_RETRIES`, `SPOTIFY_CALL_BACKOFF_BASE`
 - `SHAZAM_TIMEOUT_SECONDS`, `SHAZAM_MAX_RETRIES`, `SHAZAM_BACKOFF_BASE`
 - `LOG_FILE` – Where to write the failures log (default: `failed_tracks.log`)
+- `RESULTS_MD_FILE` – Where to write the Markdown results table (default: `results.md`)
 
 Scopes: During the first run you’ll complete the OAuth flow in the browser and approve `user-library-read` and `user-library-modify`. You don’t configure scopes in the dashboard; they’re requested by the app at login time.
 
@@ -86,7 +84,7 @@ Scopes: During the first run you’ll complete the OAuth flow in the browser and
 Run sequential (simpler; good baseline):
 
 ```sh
-uv run main_sync.py --music-folder "<path-to-music>" --client-id <id> --client-secret <secret> --redirect-uri "http://127.0.0.1:8888/callback"
+uv run main_sync.py --music-folder "<path-to-music>" --client-id <id> --client-secret <secret> --redirect-uri "http://127.0.0.1:8888/callback" --results-md results.md
 ```
 
 Run concurrent (faster on big folders):
@@ -99,8 +97,6 @@ Notes:
 
 - CLI flags override values from `.env`.
 - OAuth opens a browser; return to the terminal after authorizing.
-- Dry run by default: to actually add tracks to Liked Songs, open the files and uncomment the lines with `current_user_saved_tracks_add`.
-	- Search in `main_sync.py` and `main_async.py` for `current_user_saved_tracks_add` and remove the comment to enable real adds.
 
 ## Why `main_sync.py` uses asyncio
 

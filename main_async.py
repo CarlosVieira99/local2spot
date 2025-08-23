@@ -46,6 +46,9 @@ from rich.panel import Panel
 from rich.live import Live
 from rich import box
 
+# Markdown Results Output
+RESULTS_MD_FILE: str = os.getenv("RESULTS_MD_FILE", "results.md")
+
 # Load Environment Variables
 dotenv.load_dotenv(override=True)
 
@@ -137,6 +140,15 @@ def _normalize_query_value(value: Optional[str]) -> str:
     return s.replace('"', '\\"')
 
 
+def _markdown_cell(value: Optional[str]) -> str:
+    """Sanitize a value for inclusion in a Markdown table cell."""
+    if value is None:
+        return ""
+    s = str(value).replace("\n", " ").strip()
+    # Escape pipe which breaks table formatting
+    return s.replace("|", "\\|")
+
+
 async def _search_spotify_async(sp: spotipy.Spotify, query_title: str, query_artist: str, *, call_spotify, api_backoff_base: float) -> Tuple[Optional[str], Optional[str]]:
     """Search Spotify with retries using async executor wrapper. Returns (track_id, error)."""
     last_err: Optional[str] = None
@@ -199,8 +211,7 @@ async def _update_liked_async(sp: spotipy.Spotify, track_id: str, *, call_spotif
             contains = bool(contains_list[0]) if contains_list else False
             if contains:
                 return "already", None
-            # Original behavior kept: do not add, just report as "added"
-            # await call_spotify(sp.current_user_saved_tracks_add, tracks=[track_id], timeout=20)
+            await call_spotify(sp.current_user_saved_tracks_add, tracks=[track_id], timeout=20)
             return "added", None
         except spotipy.exceptions.SpotifyException as e:
             if getattr(e, "http_status", None) == 429:
@@ -257,6 +268,12 @@ async def main() -> int:
         default= max(2, min(8, (os.cpu_count() or 4))),
         help="Max number of files to process concurrently",
     )
+    parser.add_argument(
+        "--markdown-out",
+        type=str,
+        default=os.getenv("RESULTS_MD_FILE", RESULTS_MD_FILE),
+        help="Path to write Markdown summary table",
+    )
     args = parser.parse_args()
 
     # Validate the Arguments
@@ -287,6 +304,8 @@ async def main() -> int:
     num_already_added = 0
     processed_count = 0
     failed_tracks: List[FailedRecord] = []
+    # Collected results for Markdown export: (Filename, Search Query, Spotify Track, Artist)
+    md_rows: List[Tuple[str, str, str, str]] = []
 
     # Get the File List
     mp3_files = _discover_mp3s(args.music_folder, console)
@@ -373,10 +392,24 @@ async def main() -> int:
                 num_failed += 1
                 failed_tracks.append((str(file_path), "recognition_failed", recog_err))
                 processed_count += 1
+                # Append empty query/track info for this file
+                md_rows.append((file_name, "", "", ""))
             await update_status(live, file_name, "failed to recognize with Shazam")
             return
 
         await update_status(live, file_name, "searching on Spotify…")
+
+        # Build the exact search query string (same logic as in _search_spotify_async)
+        norm_title = _normalize_query_value(recognized_title)
+        norm_artist = _normalize_query_value(recognized_artist)
+        if norm_title and norm_artist:
+            search_query = f'track:"{norm_title}" artist:"{norm_artist}"'
+        elif norm_title:
+            search_query = f'track:"{norm_title}"'
+        elif norm_artist:
+            search_query = f'artist:"{norm_artist}"'
+        else:
+            search_query = ""
 
         # Search Spotify using the original query logic but via async wrapper
         track_id, search_err = await _search_spotify_async(
@@ -391,8 +424,25 @@ async def main() -> int:
                 num_failed += 1
                 failed_tracks.append((str(file_path), "spotify_no_match", search_err))
                 processed_count += 1
+                # Append row with query but no match
+                md_rows.append((file_name, search_query, "", ""))
             await update_status(live, file_name, "no Spotify match found")
             return
+
+        # Get track details for Markdown table (name and primary artist)
+        track_name: str = ""
+        artist_name: str = ""
+        try:
+            track_obj = await call_spotify(sp.track, track_id, timeout=20)
+            if isinstance(track_obj, dict):
+                track_name = track_obj.get("name") or ""
+                artists = track_obj.get("artists") or []
+                if artists and isinstance(artists, list):
+                    artist_name = artists[0].get("name", "")
+        except Exception:
+            # Non-fatal; leave names empty if fetch fails
+            track_name = track_name or ""
+            artist_name = artist_name or ""
 
         # Check/add liked status using async wrapper (no actual add to preserve behavior)
         status, like_err = await _update_liked_async(
@@ -402,17 +452,20 @@ async def main() -> int:
             async with lock:
                 num_already_added += 1
                 processed_count += 1
+                md_rows.append((file_name, search_query, track_name, artist_name))
             await update_status(live, file_name, "already in Liked Songs")
         elif status == "added":
             async with lock:
                 num_added += 1
                 processed_count += 1
+                md_rows.append((file_name, search_query, track_name, artist_name))
             await update_status(live, file_name, "added to Liked Songs")
         else:
             async with lock:
                 num_failed += 1
                 failed_tracks.append((str(file_path), "spotify_like_error", like_err))
                 processed_count += 1
+                md_rows.append((file_name, search_query, track_name, artist_name))
             await update_status(live, file_name, "failed to like on Spotify")
 
         await asyncio.sleep(0)
@@ -441,6 +494,8 @@ async def main() -> int:
                             num_failed += 1
                             failed_tracks.append((str(f), "file_timeout", f"exceeded {per_file_timeout}s"))
                             processed_count += 1
+                            # Append empty row on timeout
+                            md_rows.append((f.name, "", "", ""))
                         await update_status(live, f.name, "timed out; skipping")
                 finally:
                     queue.task_done()
@@ -461,6 +516,18 @@ async def main() -> int:
     # Save the Log with all the Failed Tracks
     _write_fail_log(LOG_FILE, failed_tracks)
 
+    # Write Markdown results table
+    try:
+        with open(args.markdown_out, "w", encoding="utf-8") as f:
+            f.write("| Filename | Search Query | Spotify Track | Artist |\n")
+            f.write("|---|---|---|---|\n")
+            for fn, q, tn, ar in md_rows:
+                f.write(
+                    f"| {_markdown_cell(fn)} | {_markdown_cell(q)} | {_markdown_cell(tn)} | {_markdown_cell(ar)} |\n"
+                )
+    except Exception as e:
+        console.print(f"[yellow]Warning: failed to write markdown output: {e}[/yellow]")
+
     # Add some Statistics of the Process (styled)
     def _fmt_duration(seconds: int) -> str:
         h, rem = divmod(seconds, 3600)
@@ -479,6 +546,7 @@ async def main() -> int:
     if num_failed > 0:
         summary.add_row("❌ Failed", f"[red]{num_failed}[/red]")
         summary.add_row("🗒 Log", f"[magenta]{LOG_FILE}[/magenta]")
+    summary.add_row("📄 Markdown", f"[magenta]{args.markdown_out}[/magenta]")
 
     Console().print(
         Panel(

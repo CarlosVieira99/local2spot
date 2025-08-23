@@ -62,6 +62,9 @@ SHAZAM_TIMEOUT_SECONDS: int = int(os.getenv("SHAZAM_TIMEOUT_SECONDS", "20"))
 SHAZAM_MAX_RETRIES: int = int(os.getenv("SHAZAM_MAX_RETRIES", "3"))
 SHAZAM_BACKOFF_BASE: float = float(os.getenv("SHAZAM_BACKOFF_BASE", "0.8"))
 
+# Markdown results output (can be overridden via CLI)
+RESULTS_MD_FILE: str = os.getenv("RESULTS_MD_FILE", "results.md")
+
 def _auth_spotify(client_id: str, client_secret: str, redirect_uri: str, console: Console) -> Optional[spotipy.Spotify]:
     """Authenticate with Spotify and return a client or None on failure."""
     try:
@@ -135,8 +138,12 @@ def _normalize_query_value(value: Optional[str]) -> str:
     return s.replace('"', '\\"')
 
 
-def _search_spotify(sp: spotipy.Spotify, query_title: str, query_artist: str) -> Tuple[Optional[str], Optional[str]]:
-    """Search Spotify with retries. Returns (first_track_id, error_message)."""
+def _search_spotify(sp: spotipy.Spotify, query_title: str, query_artist: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], str]:
+    """Search Spotify with retries.
+
+    Returns (track_id, track_name, track_artist, error_message, query_used).
+    On failure, track_* are None and error_message is set. query_used is always returned.
+    """
     last_err: Optional[str] = None
     norm_title = _normalize_query_value(query_title)
     norm_artist = _normalize_query_value(query_artist)
@@ -153,7 +160,11 @@ def _search_spotify(sp: spotipy.Spotify, query_title: str, query_artist: str) ->
             sp_result = sp.search(q=query, limit=SPOTIFY_SEARCH_LIMIT)
             items = sp_result.get("tracks", {}).get("items", []) if sp_result else []
             if items:
-                return items[0]["id"], None
+                first = items[0]
+                track_id = first.get("id")
+                track_name = first.get("name")
+                track_artists = ", ".join(a.get("name", "") for a in first.get("artists", []) if isinstance(a, dict)) or None
+                return track_id, track_name, track_artists, None, query
             last_err = "no_match"
         except spotipy.exceptions.SpotifyException as e:
             if getattr(e, "http_status", None) == 429:
@@ -177,7 +188,7 @@ def _search_spotify(sp: spotipy.Spotify, query_title: str, query_artist: str) ->
             backoff = SPOTIFY_CALL_BACKOFF_BASE * (2 ** (attempt - 1))
             time.sleep(backoff)
 
-    return None, last_err
+    return None, None, None, last_err, query
 
 
 def _update_liked(sp: spotipy.Spotify, track_id: str) -> Tuple[str, Optional[str]]:
@@ -234,6 +245,29 @@ def _write_fail_log(log_file: str, failed_tracks: List[FailedRecord]) -> None:
             f.write(f"{path}\t{stage}\t{msg}\n")
 
 
+def _md_escape(cell: Optional[str]) -> str:
+    """Escape Markdown table cell content (pipes and newlines)."""
+    if not cell:
+        return ""
+    return str(cell).replace("|", "\\|").replace("\n", " ")
+
+
+def _write_results_md(md_file: str, rows: List[Tuple[str, str, str, str]]) -> None:
+    """Write results to a Markdown table.
+
+    Columns: Filename | Search Query | Spotify Track | Artist
+    """
+    if not rows:
+        return
+    header = "| Filename | Search Query | Spotify Track | Artist |\n|---|---|---|---|\n"
+    with open(md_file, "w", encoding="utf-8") as f:
+        f.write(header)
+        for filename, query, track_name, track_artist in rows:
+            f.write(
+                f"| {_md_escape(filename)} | {_md_escape(query)} | {_md_escape(track_name)} | {_md_escape(track_artist)} |\n"
+            )
+
+
 async def main() -> int:
     # Set up Input Arguments
     parser = argparse.ArgumentParser(
@@ -246,6 +280,7 @@ async def main() -> int:
     parser.add_argument("--client-id", type=str, default=os.getenv("SPOTIFY_CLIENT_ID"), help="Spotify Client ID")
     parser.add_argument("--client-secret", type=str, default=os.getenv("SPOTIFY_CLIENT_SECRET"), help="Spotify Client Secret")
     parser.add_argument("--redirect-uri", type=str, default=os.getenv("SPOTIFY_REDIRECT_URI"), help="Spotify Redirect URI")
+    parser.add_argument("--results-md", type=str, default=RESULTS_MD_FILE, help="Path to write Markdown results table")
     args = parser.parse_args()
 
     # Validate the Arguments
@@ -273,6 +308,7 @@ async def main() -> int:
     num_failed = 0
     num_already_added = 0
     failed_tracks: List[FailedRecord] = []
+    results_rows: List[Tuple[str, str, str, str]] = []  # Filename, Search Query, Spotify Track, Artist
 
     # Get the File List
     mp3_files = _discover_mp3s(args.music_folder, console)
@@ -352,6 +388,8 @@ async def main() -> int:
             if not recognized_title:
                 num_failed += 1
                 failed_tracks.append((str(mp3_file), "recognition_failed", recog_err))
+                # Include row for recognition failure
+                results_rows.append((current_file_name, "", "-", "-"))
                 live.update(render_status_panel(idx, num_tracks, current_file_name, status="failed to recognize with Shazam", recognized=recognized_title))
                 continue
 
@@ -359,23 +397,28 @@ async def main() -> int:
             live.update(render_status_panel(idx, num_tracks, current_file_name, status="searching on Spotify…", recognized=recognized_title))
 
             # Search for the Track on Spotify
-            track_id, search_err = _search_spotify(sp, recognized_title, recognized_artist)
+            track_id, track_name, track_artist, search_err, query_used = _search_spotify(sp, recognized_title, recognized_artist)
             if not track_id:
                 num_failed += 1
                 failed_tracks.append((str(mp3_file), "spotify_no_match", search_err))
+                # Collect row even for failures
+                results_rows.append((current_file_name, query_used or "", "-", "-"))
                 live.update(render_status_panel(idx, num_tracks, current_file_name, status="no Spotify match found", recognized=recognized_title))
                 continue
 
             status, like_err = _update_liked(sp, track_id)
             if status == "already":
                 num_already_added += 1
+                results_rows.append((current_file_name, query_used or "", track_name or "", track_artist or ""))
                 live.update(render_status_panel(idx, num_tracks, current_file_name, status="already in Liked Songs", recognized=recognized_title))
             elif status == "added":
                 num_added += 1
+                results_rows.append((current_file_name, query_used or "", track_name or "", track_artist or ""))
                 live.update(render_status_panel(idx, num_tracks, current_file_name, status="added to Liked Songs", recognized=recognized_title))
             else:
                 num_failed += 1
                 failed_tracks.append((str(mp3_file), "spotify_like_error", like_err))
+                results_rows.append((current_file_name, query_used or "", track_name or "", track_artist or ""))
                 live.update(render_status_panel(idx, num_tracks, current_file_name, status="failed to like on Spotify", recognized=recognized_title))
 
             # Limit the Spotify API Call Rate without blocking the event loop
@@ -383,6 +426,13 @@ async def main() -> int:
 
     # Save the Log with all the Failed Tracks
     _write_fail_log(LOG_FILE, failed_tracks)
+
+    # Write Markdown results table
+    try:
+        _write_results_md(args.results_md, results_rows)
+        results_md_note = args.results_md
+    except Exception:
+        results_md_note = None
 
     # Add some Statistics of the Process (styled)
     def _fmt_duration(seconds: int) -> str:
@@ -402,6 +452,8 @@ async def main() -> int:
     if num_failed > 0:
         summary.add_row("❌ Failed", f"[red]{num_failed}[/red]")
         summary.add_row("🗒 Log", f"[magenta]{LOG_FILE}[/magenta]")
+    if results_md_note:
+        summary.add_row("📄 Results", f"[magenta]{results_md_note}[/magenta]")
 
     Console().print(
         Panel(
